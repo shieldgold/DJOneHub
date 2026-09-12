@@ -208,7 +208,7 @@ func main() {
 				usbDevice:        usbDevice,
 				usbAT:            usbATDevice,
 				smsPollInterval:  8 * time.Second,
-				smsAutoCleanupME: true,
+				smsAutoCleanupME: false,
 				smsReassembler:   smscodec.NewReassembler(),
 			}
 			if usbDevice != nil {
@@ -249,7 +249,7 @@ func main() {
 		log.Fatalf("create modem manager: %v", err)
 	}
 
-	instance := &app{modem: manager, port: port, smsPollInterval: 8 * time.Second, smsAutoCleanupME: true}
+	instance := &app{modem: manager, port: port, smsPollInterval: 8 * time.Second, smsAutoCleanupME: false}
 	manager.SetSMSCallback(instance.recordSMS)
 	if err := manager.Start(); err != nil {
 		log.Fatalf("open modem on %s: %v", port, err)
