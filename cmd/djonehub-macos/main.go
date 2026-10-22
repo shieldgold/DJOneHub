@@ -73,6 +73,10 @@ type modulePhonebookEntry struct {
 }
 
 type app struct {
+	smsOutcomeMu      sync.Mutex
+	smsOutcome        smsSendOutcome
+	simRecoveryOnce   sync.Once
+	simRecovery       *simRecovery
 	modem             *modem.Manager
 	esimMu            sync.RWMutex
 	esim              *esim.Manager
@@ -604,10 +608,16 @@ func (a *app) startSMSPoller(ctx context.Context) {
 }
 
 func (a *app) pollSMSOnce() error {
+	a.smsSendMu.Lock()
+	defer a.smsSendMu.Unlock()
 	if a.demo || a.modem != nil {
 		return nil
 	}
 	if err := a.ensureUSBAT(); err != nil {
+		a.setSMSPollStatus(err)
+		return err
+	}
+	if err := a.ensureSIMReady(); err != nil {
 		a.setSMSPollStatus(err)
 		return err
 	}
@@ -985,8 +995,8 @@ func parseUSBATQNWInfo(resp string) (mode, duplex, band string, channel uint32) 
 }
 
 func (a *app) readUSBATSMS() ([]receivedSMS, error) {
-	if _, err := a.usbAT.Command("AT+CMGF=0", 3*time.Second); err != nil {
-		return nil, fmt.Errorf("set SMS PDU mode: %w", err)
+	if response, err := a.usbAT.Command("AT+CMGF=0", 3*time.Second); err != nil || !atProbeSucceeded(response) {
+		return nil, errors.New("无法设置短信模式，请检查 SIM 和网络状态")
 	}
 	memories := []string{"SM", "ME"}
 	seen := make(map[string]bool)
@@ -1017,12 +1027,15 @@ func (a *app) readUSBATSMS() ([]receivedSMS, error) {
 }
 
 func (a *app) readUSBATSMSFromMemory(memory string) ([]receivedSMS, error) {
-	if _, err := a.usbAT.Command(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second); err != nil {
-		return nil, fmt.Errorf("select storage: %w", err)
+	if response, err := a.usbAT.Command(fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, memory, memory, memory), 5*time.Second); err != nil || !atProbeSucceeded(response) {
+		return nil, errors.New("短信存储暂不可用")
 	}
 	resp, err := a.usbAT.Command("AT+CMGL=4", 15*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("list SMS: %w", err)
+	}
+	if !atProbeSucceeded(resp) {
+		return nil, errors.New("模块未确认短信读取，请稍后重试")
 	}
 	pdus := parseUSBATCMGL(resp)
 	messages := make([]receivedSMS, 0, len(pdus))
@@ -1159,6 +1172,8 @@ func (a *app) smsStatus(w http.ResponseWriter, _ *http.Request) {
 		"polling":         !a.demo && a.modem == nil,
 		"poll_interval_s": int(a.smsPollInterval.Seconds()),
 		"auto_cleanup_me": a.smsAutoCleanupME,
+		"sim_recovery":    a.simRecoveryStatus(),
+		"last_send":       a.smsSendSnapshot(),
 		"last_poll":       lastPoll,
 		"last_poll_error": lastPollError,
 	})
@@ -1262,9 +1277,14 @@ func (a *app) sendSMS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"sent": true, "segments": 1})
 		return
 	}
+	if !a.beginSMSSend() {
+		writeError(w, http.StatusConflict, "已有短信正在发送，请等待结果")
+		return
+	}
 	segments, err := a.sendTextSMS(body.Phone, body.Message)
+	outcome := a.finishSMSSend(segments, err)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": outcome.Error, "state": outcome.State, "segments": segments})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sent": true, "segments": segments})
@@ -1291,6 +1311,9 @@ func (a *app) sendUSBATSMS(phone, message string) (int, error) {
 		return 0, errors.New("AT serial port is unavailable")
 	}
 
+	if err := a.ensureSIMReady(); err != nil {
+		return 0, err
+	}
 	modeResponse, err := a.usbAT.Command("AT+CMGF=0", 5*time.Second)
 	if err != nil {
 		a.resetUSBATIfGone(err)
@@ -1312,12 +1335,9 @@ func (a *app) sendUSBATSMS(phone, message string) (int, error) {
 			payload,
 			45*time.Second,
 		)
-		if sendErr != nil {
+		if submissionErr := checkSMSSubmission(response, sendErr); submissionErr != nil {
 			a.resetUSBATIfGone(sendErr)
-			return i, fmt.Errorf("send SMS segment %d/%d: %w", i+1, len(tpdus), sendErr)
-		}
-		if atResponseIsError(response) || !strings.Contains(response, "+CMGS:") || !atProbeSucceeded(response) {
-			return i, fmt.Errorf("send SMS segment %d/%d failed: %s", i+1, len(tpdus), response)
+			return i, submissionErr
 		}
 		if i+1 < len(tpdus) {
 			time.Sleep(500 * time.Millisecond)

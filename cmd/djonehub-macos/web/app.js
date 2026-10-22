@@ -1,5 +1,6 @@
 const $ = (selector) => document.querySelector(selector);
 let lastSMSCount = null;
+let smsSending = false;
 let esimHealthPollTimer = null;
 let esimHealthInFlight = false;
 let networkTrafficTimer = null;
@@ -250,6 +251,12 @@ async function loadSMS() {
     const cleanupText = status.auto_cleanup_me ? "自动清理 ME 已开启" : "自动清理 ME 未开启";
     const errorText = status.last_poll_error ? ` · 最近错误：${status.last_poll_error}` : "";
     $("#sms-status").textContent = `当前缓存 ${messages.length} 条短信 · ${pollText} · ${cleanupText}${errorText}`;
+    if (status.sim_recovery) $("#sms-status").textContent += ` · ${status.sim_recovery}`;
+    if (!smsSending && status.last_send?.state) {
+      const sent = status.last_send;
+      const states = {sending: "发送中，请等待模块确认", submitted: `已提交 ${sent.segments} 个分片到网络，尚未确认对方收到。`, failed: "发送未完成", unknown: "发送结果不确定，请核对接收端，不要直接重发"};
+      $("#send-status").textContent = `${states[sent.state] || sent.state}${sent.error ? "：" + sent.error : ""}`;
+    }
     if (lastSMSCount !== null && messages.length > lastSMSCount) {
       notice(`收到 ${messages.length - lastSMSCount} 条新短信`);
     }
@@ -1008,21 +1015,32 @@ $("#esim-download-form").addEventListener("submit", async (event) => {
 
 $("#send-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const button = event.submitter;
+  if (smsSending) return;
+  const button = event.submitter || $("#send-form").querySelector('button[type="submit"]');
+  const status = $("#send-status");
   const originalLabel = button.textContent;
+  smsSending = true;
   button.disabled = true;
   button.textContent = "发送中";
+  status.textContent = "发送中，请等待模块确认，不要重复点击或切换模式。";
   try {
     const result = await api("/api/sms/send", {
       method: "POST",
+      signal: AbortSignal.timeout(120000),
       body: JSON.stringify({ phone: $("#phone").value, message: $("#message").value }),
     });
     $("#message").value = "";
     const segments = Number(result.segments || 1);
-    notice(segments > 1 ? `短信已发送（${segments} 个分片）` : "短信已发送");
+    status.textContent = `已提交 ${segments} 个分片到网络，尚未确认对方收到。`;
+    notice(status.textContent);
   } catch (error) {
-    notice(error.message);
+    const uncertain = error.name === "TimeoutError" || error.name === "AbortError" || error instanceof TypeError;
+    status.textContent = uncertain
+      ? "请求超时或连接中断，发送结果不确定。请等待状态更新并核对接收端，不要直接重发。"
+      : `发送未完成：${error.message}`;
+    notice(status.textContent);
   } finally {
+    smsSending = false;
     button.disabled = false;
     button.textContent = originalLabel;
   }
